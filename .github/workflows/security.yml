@@ -1,0 +1,177 @@
+# ZENTRALER Sicherheits- und Datenschutz-Check für alle Repos von joachim-png
+# Liegt im Repo "joachim-png/.github" und wird von jedem Repo nur aufgerufen.
+# Änderungen hier gelten sofort für ALLE Repos.
+name: Security & Datenschutz (zentral)
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python-Version für Bandit und pip-audit"
+        type: string
+        default: "3.12"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # 1) Geheimnisse – gilt für jede Sprache
+  secrets:
+    name: Geheimnisse (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 2) Code-Analyse für viele Sprachen + zentrale Datenschutz-Regeln
+  semgrep:
+    name: Code-Analyse (Semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zentrale Datenschutz-Regeln bereitstellen
+        run: |
+          mkdir -p /tmp/zentral-regeln
+          cat > /tmp/zentral-regeln/datenschutz.yml <<'EOF'
+          rules:
+            - id: sensible-daten-in-ausgabe-oder-log
+              languages: [python]
+              severity: ERROR
+              message: >-
+                Sensible Daten (PIN, TAN, IBAN, Passwort, Token, Schlüssel) werden
+                ausgegeben oder geloggt. Wert maskieren oder weglassen.
+              patterns:
+                - pattern-either:
+                    - pattern: print(..., $X, ...)
+                    - pattern: st.write(..., $X, ...)
+                    - pattern: st.text(..., $X, ...)
+                    - patterns:
+                        - pattern: $LOG.$F(..., $X, ...)
+                        - metavariable-regex:
+                            metavariable: $F
+                            regex: ^(debug|info|warning|warn|error|exception|critical|log)$
+                - metavariable-regex:
+                    metavariable: $X
+                    regex: (?i).*(\bpin\b|_pin|pin_|\btan\b|_tan|iban|kontonummer|passw|secret|token|api_key|db_key|schluessel)
+
+            - id: sensible-daten-in-konsole-js
+              languages: [javascript, typescript]
+              severity: ERROR
+              message: >-
+                Sensible Daten (PIN, Passwort, Token, Schlüssel) werden in der
+                Konsole ausgegeben. Wert maskieren oder weglassen.
+              patterns:
+                - pattern: console.$F(..., $X, ...)
+                - metavariable-regex:
+                    metavariable: $X
+                    regex: (?i).*(\bpin\b|_pin|pin_|\btan\b|iban|passw|secret|token|api_?key)
+
+            - id: tls-pruefung-abgeschaltet
+              languages: [python]
+              severity: ERROR
+              message: >-
+                Zertifikatsprüfung abgeschaltet (verify=False) – Verbindung kann
+                abgehört oder gefälscht werden.
+              pattern-either:
+                - pattern: requests.$M(..., verify=False, ...)
+                - pattern: httpx.$M(..., verify=False, ...)
+                - pattern: httpx.Client(..., verify=False, ...)
+
+            - id: unverschluesselte-http-verbindung
+              languages: [python, javascript, typescript]
+              severity: ERROR
+              message: >-
+                Unverschlüsselte http://-Adresse – immer https:// verwenden
+                (Ausnahme: localhost).
+              pattern-regex: http://(?!localhost|127\.0\.0\.1|0\.0\.0\.0)[A-Za-z0-9]
+
+            - id: unverschluesselte-datenbank
+              languages: [python]
+              severity: WARNING
+              message: >-
+                SQLite ohne Verschlüsselung. Für Finanz- oder Personendaten
+                verschlüsselte Datenbank verwenden (z. B. SQLCipher).
+              pattern: sqlite3.connect(...)
+
+            - id: datenabfluss-an-externe-dienste
+              languages: [python]
+              severity: WARNING
+              message: >-
+                Netzwerkverbindung nach außen. Prüfen: Wohin gehen die Daten?
+                Werden Personen- oder Finanzdaten an Dritte gesendet?
+              pattern-either:
+                - pattern: requests.$M(...)
+                - pattern: httpx.$M(...)
+                - pattern: urllib.request.urlopen(...)
+                - pattern: socket.socket(...)
+          EOF
+
+      - name: Blockierende Funde (Schweregrad ERROR)
+        run: |
+          LOKAL=""
+          # Ein Repo kann eigene Zusatzregeln im Ordner .semgrep/ mitbringen
+          if [ -d .semgrep ]; then LOKAL="--config .semgrep/"; fi
+          semgrep scan --metrics=off \
+            --config p/default \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --config /tmp/zentral-regeln/ \
+            $LOKAL \
+            --severity ERROR --error
+
+      - name: Hinweise zur Prüfung (blockieren nicht)
+        run: |
+          LOKAL=""
+          if [ -d .semgrep ]; then LOKAL="--config .semgrep/"; fi
+          semgrep scan --metrics=off --config /tmp/zentral-regeln/ $LOKAL --severity WARNING
+
+  # 3) Python-Sicherheit – läuft nur, wenn das Repo Python-Dateien hat
+  bandit:
+    name: Python-Sicherheit (Bandit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prüfung
+        if: hashFiles('**/*.py') != ''
+        run: |
+          pip install bandit
+          bandit -r . -x ./.venv,./venv,./tests -ll -ii
+      - name: Kein Python im Repo
+        if: hashFiles('**/*.py') == ''
+        run: echo "Keine Python-Dateien – übersprungen."
+
+  # 4) Bibliotheken mit bekannten Sicherheitslücken (Python und JavaScript)
+  dependencies:
+    name: Abhängigkeiten (pip-audit / npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Abhängigkeiten prüfen
+        run: |
+          GEFUNDEN=0
+          if [ -f requirements.txt ]; then
+            pip install pip-audit && pip-audit -r requirements.txt; GEFUNDEN=1
+          elif [ -f pyproject.toml ]; then
+            pip install pip-audit && pip install . && pip-audit; GEFUNDEN=1
+          fi
+          if [ -f package-lock.json ]; then
+            npm audit --audit-level=high; GEFUNDEN=1
+          fi
+          if [ "$GEFUNDEN" = "0" ]; then
+            echo "Keine Abhängigkeitsdatei gefunden – übersprungen."
+          fi
